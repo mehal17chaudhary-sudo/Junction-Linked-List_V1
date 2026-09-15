@@ -18,6 +18,7 @@ the PDF — they match the paper's reported numbers exactly.
 - [DELETE](#delete)
 - [Cross-device check](#cross-device-check)
 - [Statistical significance](#statistical-significance)
+- [Asymptotic comparison (Big-O)](#asymptotic-comparison-big-o)
 - [Summary](#summary)
 
 ---
@@ -159,6 +160,74 @@ process repetitions to be noise.
 
 ---
 
+## Asymptotic comparison (Big-O)
+
+Everything above is a *measured constant-factor* comparison. The paper is explicit
+(Appendix B, Table 2, Section 4.1) that in **O-notation**, JLI and the skip list sit in the
+*same* complexity class for every operation — JLI's real advantage lives in the constant,
+not the order of growth.
+
+### Search / locate
+
+| | JLI | Skip list |
+|---|---|---|
+| Search | O(log n + S/K) | O(log n) expected |
+
+Derivation (Appendix B): descent cost decomposes as
+
+```
+T_search = O(log B) + O(log M) + O(log K) + O(S/K)
+```
+
+Substituting B = n/(S·M) and treating K, M as fixed tuning constants collapses this to
+`O(log n) + O(S/K)`. This **only** reduces to a clean `O(log n)` if K scales with S
+(K = Θ(S)). Under the paper's actual benchmark configuration — K held fixed — the `S/K`
+term is a real, uncancelled linear-in-S walk cost, kept small in practice only by choosing
+S small relative to n, not by any asymptotic guarantee. The paper is explicit that folding
+`S/K` into `O(log S)` is an *invalid* simplification, since `S/K` is linear in S, not
+logarithmic.
+
+### Insert / Delete
+
+| | JLI | Skip list |
+|---|---|---|
+| Given location (splice) | O(1) | O(1) expected |
+| Including locate | O(log n) *amortized, conditional* | O(log n) expected |
+| Delete, dissolution worst case | O(S + J + B) | — (no analogue) |
+
+JLI's amortized `O(log n)` bound holds **only if** the three deferred-maintenance tiers'
+firing rates stay `o(log n)` per mutation — a property of the *workload*, not one the
+structure guarantees unconditionally. Section 4.1 proves this fails under monotonic tail
+append (INSERT-adversarial) and tail-backward deletion (DELETE-adversarial): mutation
+concentrated at one boundary drives the sub-optimal-rebuild firing rate to `Θ(1/S)`
+(constant in n), so the `O(B)` rebuild floor it pays each time does *not* vanish as n
+grows — the mechanism behind the +155% reversal in the maintenance ablation (Section 5).
+
+### Space
+
+| | JLI | Skip list |
+|---|---|---|
+| Index overhead | Θ(n) | Θ(n) — n·(1/(1−p)) expected forward pointers/node |
+
+Same asymptotic order. JLI's 75–80% measured advantage (Section 7) is a **constant-factor**
+difference — spreading index cost across segments of size S and blocks of size M rather
+than charging it once per node — not a smaller order of growth.
+
+### Guarantee type
+
+The one qualitative (non-Big-O) difference the paper stresses: skip-list bounds above are
+*expected*, exactly like JLI's — **neither** structure gives a deterministic worst-case
+guarantee. (That distinction only shows up when JLI is instead compared against a
+B+-tree in Appendix H, where the B+-tree's `O(log_B n)` bound is deterministic rather than
+probabilistic — a different comparison than the one this benchmark suite measures.)
+
+**Bottom line:** every operation JLI and the skip list share is the *same complexity
+class*. The paper's contribution, and everything measured in the sections above, is about
+the constant factor inside that class — smaller per-node memory footprint, and a
+cache-friendlier constant on search — not a better asymptotic bound.
+
+---
+
 ## Summary
 
 | Dimension | Result |
@@ -168,6 +237,7 @@ process repetitions to be noise.
 | INSERT | +7.28% slower on average — faster under `adversarial`/`random`, worse under `zipfian`/`sequential` |
 | DELETE | +4.31% slower on average — faster under `sequential`/`random`, much worse under `adversarial` |
 | Cross-device | Memory advantage is hardware-independent; latency advantage narrows/reverses at n = 1M on lower-core-count hardware |
+| Asymptotic class | Identical to the skip list in every operation (O(log n) search, O(log n) amortized mutation, Θ(n) space) — the paper's gains are constant-factor, not asymptotic |
 
 JLI trades a probabilistic search bound for a smaller memory constant and faster search,
 at the cost of a workload-dependent mutation tax concentrated wherever sustained
