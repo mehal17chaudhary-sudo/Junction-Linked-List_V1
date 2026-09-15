@@ -1,3 +1,36 @@
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * Junction-Linked List (JLI) — reference implementation, v8.1
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * High-level idea:
+ *   A plain singly linked list is chopped into contiguous "segments" of
+ *   roughly `segment_size` nodes. Each segment is described by a
+ *   `Junction`, which caches:
+ *     - the segment's start/end node,
+ *     - a small sorted array of "shortcut" pointers into the segment
+ *       (so we don't have to walk every node to get partway through it),
+ *     - a single distinguished "junction node" near the segment's middle.
+ *   Junctions are themselves kept in a sorted array and grouped into
+ *   fixed-capacity `JunctionBlock`s; the blocks are indexed by a
+ *   skip list so we can jump close to the right block in O(log n)
+ *   expected time before falling back to a linear/binary walk inside
+ *   the segment.
+ *
+ *   The overall aim (per the accompanying paper) is to trade a small
+ *   amount of memory (the shortcuts + block skip list) for search
+ *   performance closer to an array/skip-list than a raw linked list,
+ *   while keeping O(1) splice-style insert/delete once the insertion
+ *   point is known — without per-node indices that a plain array or
+ *   flat skip list would require to be kept in sync.
+ *
+ *   Because insertions and deletions gradually make segments too big,
+ *   too small, or unbalanced (junction node no longer near the middle),
+ *   a maintenance system periodically re-shortcuts ("local rebuild"),
+ *   re-partitions a region of segments ("suboptimal rebuild"), or
+ *   rebuilds the entire structure from scratch ("global rebuild").
+ */
+
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -12,21 +45,56 @@
 #include <assert.h>
 #include <errno.h>
 
+/* Branch-prediction hints for the compiler; purely a performance nicety,
+ * they don't change behavior. LIKELY(x) says "x is usually true". */
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
+/* Safety cap on how many nodes estimate_target_node() will walk/stage
+ * while narrowing in on a target value inside a segment. Bounds a
+ * fixed-size on-stack buffer and guarantees termination even if the
+ * segment is pathologically large or the estimate is badly wrong. */
 #define MAX_ESTIMATE_WINDOW 512
 
 /* ═══════════════════════════════════════════════════════════════════════
    DATA STRUCTURES
    ═══════════════════════════════════════════════════════════════════════ */
 
+/* A single element of the underlying sorted singly linked list.
+ * `value` is the sort key; `payload` is an opaque user pointer that this
+ * structure never interprets, only carries around. */
 typedef struct Node {
     int32_t       value;
     void         *payload;
     struct Node  *next;
 } Node;
 
+/* Describes one segment of the list.
+ *
+ *   segment_start / segment_end : first and last Node in this segment.
+ *   node                        : the distinguished "junction node",
+ *                                 nominally near the segment midpoint;
+ *                                 used as an extra probe point during
+ *                                 search so we don't always have to
+ *                                 walk from segment_start.
+ *   junction_offset             : `node`'s position (0-based) within
+ *                                 the segment, i.e. how many nodes
+ *                                 precede it starting at segment_start.
+ *   shortcuts[]                 : sorted array of pointers into the
+ *                                 segment (always includes segment_start
+ *                                 at index 0 and segment_end at the
+ *                                 last index) used for a binary search
+ *                                 within the segment before falling
+ *                                 back to linear pointer-chasing.
+ *   shortcuts_len               : number of live entries in shortcuts[]
+ *                                 (<= K, the flexible array's capacity).
+ *   prev_junction / next_junction: doubly-linked ring over all junctions,
+ *                                 refreshed by junc_relink() whenever the
+ *                                 junction array changes shape.
+ *
+ * Allocated with a C99 flexible array member so the shortcuts array is
+ * sized to exactly K pointers in a single allocation (see junction_new).
+ */
 typedef struct Junction {
     Node            *node;
     Node            *segment_start;
@@ -39,12 +107,22 @@ typedef struct Junction {
     Node            *shortcuts[];       /* flexible array: K elements */
 } Junction;
 
+/* A candidate "anchor" node used while estimating where a target value
+ * lives within a segment (see estimate_target_node()). `est_offset` is
+ * this anchor's estimated position within the *live* segment, used to
+ * bound how far we need to walk from it. */
 typedef struct {
     Node    *node;
     int32_t  est_offset;
 } AnchorRef;
 
-/* ── block structure ── */
+/* ── block structure ──
+ * A JunctionBlock groups a run of consecutive Junctions so the
+ * block-level skip list (see below) has far fewer, coarser-grained
+ * entries to index than the full junction array would. A block's
+ * value range is never stored explicitly — it's always read live off
+ * its first/last junction's segment_start/segment_end — so it can
+ * never go stale relative to in-place edits to those junctions. */
 typedef struct JunctionBlock {
     Junction **junctions;          /* pointer to array of junction pointers */
     int32_t    count;              /* live junctions (0 .. capacity) */
@@ -55,17 +133,23 @@ typedef struct JunctionBlock {
     /* range is computed live: start = junctions[0]->segment_start, end = junctions[count-1]->segment_end */
 } JunctionBlock;
 
+/* Top-level handle for the whole structure: the raw linked list plus
+ * all of the JLI indexing/maintenance state layered on top of it. */
 typedef struct {
     Node    *head;
     int32_t  length;
 
+    /* Sorted (by segment order) array of every live Junction. */
     Junction **junctions;
     int32_t    num_junctions;
     int32_t    junctions_cap;
 
     int32_t    max_skip_level;
 
-    /* ── block fields ── */
+    /* ── block fields ──
+     * blocks[] partitions junctions[] into fixed-capacity runs;
+     * block_skip_heads[] is the entry point array for the skip list
+     * over those blocks (index 0 = bottom/densest level). */
     JunctionBlock **blocks;
     int32_t         num_blocks;
     int32_t         blocks_cap;
@@ -73,6 +157,8 @@ typedef struct {
     int32_t         block_m;            /* soft capacity per block */
     int32_t         block_hard_max;     /* hard limit (block_m + 2) */
 
+    /* ── tunable structural/maintenance parameters (see validate_jli_parameters
+     * and jli_create for their meaning and valid ranges) ── */
     int32_t segment_size;
     int32_t K;                         /* maximum shortcuts per junction */
     bool    enable_rebuild;
@@ -91,12 +177,22 @@ typedef struct {
 
     double  level_probability;
 
+    /* Cache of the junction (and its predecessor) touched by the most
+     * recent search/mutation, so a follow-up delete on the same key
+     * can skip re-locating it. Cleared whenever a rebuild invalidates it. */
     Junction *last_junction;
     Junction *last_prev_junction;
 
+    /* ── maintenance scheduling counters ──
+     * local_ops_counter / sub_ops_counter count mutations since the
+     * last local / suboptimal maintenance pass respectively; when they
+     * hit local_interval / sub_interval, maintenance_hook() fires the
+     * corresponding pass (see maintenance_hook). */
     int32_t local_ops_counter;
     int32_t sub_ops_counter;
     int32_t sub_event_before_global;
+
+    /* ── running statistics, exposed via jli_get_maintenance_stats() ── */
     int32_t search_count;
     int32_t insert_count;
     int32_t delete_count;
@@ -111,8 +207,18 @@ typedef struct {
     int64_t last_search_steps;
 } JLI;
 
+/* Two independent xorshift64 PRNG states:
+ *   rng_state     — used by the standalone reference skip list (SL) at
+ *                   the bottom of this file.
+ *   jli_rng_state — used by JLI's own block skip-list level generator
+ *                   (random_level()).
+ * Kept separate so exercising one structure doesn't perturb the other's
+ * random level sequence when both are benchmarked in the same process. */
 static uint64_t jli_rng_state = 0xdeadbeefcafeULL;
 static uint64_t rng_state = 0xdeadbeefcafeULL;
+
+/* Re-seed both PRNGs from a single base seed, XORed with distinct
+ * constants so the two streams diverge even for the same base_seed. */
 void seed_structure_prngs(uint64_t base_seed) {
     rng_state = base_seed ^ 0xdeadbeefcafeULL;
     jli_rng_state = base_seed ^ 0xcafebeefdeadULL;
@@ -121,6 +227,12 @@ void seed_structure_prngs(uint64_t base_seed) {
 /* ═══════════════════════════════════════════════════════════════════════
    PARAMETER VALIDATION GATEKEEPER
    ═══════════════════════════════════════════════════════════════════════ */
+/* Sanity-checks every tunable ratio/interval accepted by jli_create().
+ * Most parameters are fractions and must lie in [0, 1]; a few pairs have
+ * an ordering constraint (e.g. soft_pct must be < hard_pct). Any
+ * violation is reported to stderr, and if at least one is invalid the
+ * process aborts via exit(22) rather than silently running with a
+ * nonsensical configuration. */
 void validate_jli_parameters(
     double level_probability,
     double emergency_hard_segment_ratio,
@@ -194,12 +306,20 @@ void validate_jli_parameters(
    NODE / JUNCTION HELPERS
    ═══════════════════════════════════════════════════════════════════════ */
 
+/* Allocate a single list node. Caller owns `payload`'s lifetime; JLI
+ * never frees it (see junction_free / jli_destroy, which only free the
+ * Node/Junction structs themselves). */
 static Node *node_new(int32_t value, void *payload) {
     Node *n = malloc(sizeof *n);
     n->value = value; n->payload = payload; n->next = NULL;
     return n;
 }
 
+/* Allocate a new Junction with room for K shortcut pointers, using a
+ * single calloc so the flexible array member is contiguous with the
+ * struct. Initializes it as a degenerate one-node segment: `node`,
+ * `segment_start`, and `segment_end` all point at `node` until the
+ * caller fills in the real segment via build_shortcuts() or by hand. */
 static Junction *junction_new(Node *node, int32_t K) {
     Junction *j = calloc(1, sizeof(Junction) + K * sizeof(Node*));
     if (!j) return NULL;
@@ -208,6 +328,9 @@ static Junction *junction_new(Node *node, int32_t K) {
     return j;
 }
 
+/* Frees a Junction struct itself. Does NOT free the underlying list
+ * nodes it points into (segment_start/end, shortcuts, node) — those
+ * are owned by the main linked list, not by the Junction. */
 static void junction_free(Junction *j) {
     if (j) {
         free(j);
@@ -216,9 +339,28 @@ static void junction_free(Junction *j) {
 
 /* ═══════════════════════════════════════════════════════════════════════
    SHORTCUT PLANNING (K‑driven, no hard limit)  – unchanged
-   ═══════════════════════════════════════════════════════════════════════ */
-/* ... all shortcut planning functions remain exactly as in the original v8 ... */
-/* (I've kept them here for completeness but they are identical to the question's listing) */
+   ═══════════════════════════════════════════════════════════════════════
+   The functions below decide WHERE, as fractional offsets within a
+   segment of length seg_len, shortcut pointers "ideally" should sit so
+   that binary-searching them narrows the search as evenly as possible.
+   They operate purely on offsets/indices (not on live Node pointers),
+   which is what makes them reusable both when a segment is first built
+   (offsets map directly onto real node positions) and later, after
+   inserts/deletes have shifted things, when they're used as an
+   *estimate* of where a shortcut should logically be relative to the
+   segment's current midpoint (see map_planned_offset_to_live). */
+
+/* Plans up to `needed` = (K-2) *interior* shortcut offsets (i.e.
+ * excluding the two endpoints, which are always segment_start/end and
+ * handled separately) using a breadth-first bisection: start with the
+ * two halves [0, mid] and [mid, end], repeatedly bisect whichever
+ * interval was queued first, and record its midpoint as a shortcut
+ * offset (skipping it if it collides with 0, mid_idx, or the end).
+ * This spreads shortcuts roughly evenly across the segment in the
+ * order most useful first (coarsest gaps get subdivided earliest).
+ * Writes into `offsets` (capacity `cap`) and returns how many were
+ * written. `ql`/`qr` form a small fixed-size work queue (256 entries
+ * is far more than any realistic K would need). */
 static int plan_shortcut_offsets(int32_t seg_len, int32_t K,
                                   int32_t *offsets, int32_t cap) {
     int needed = (K > 2 ? K - 2 : 0);
@@ -243,6 +385,8 @@ static int plan_shortcut_offsets(int32_t seg_len, int32_t K,
     return n_out;
 }
 
+/* Simple insertion sort of an int32 offset array in place, ascending.
+ * n is always small here (bounded by K), so O(n^2) is fine. */
 static void sort_offsets_asc(int32_t *offsets, int32_t n) {
     for (int32_t i = 1; i < n; i++) {
         int32_t v = offsets[i], j = i - 1;
@@ -251,12 +395,21 @@ static void sort_offsets_asc(int32_t *offsets, int32_t n) {
     }
 }
 
+/* Clamp v into [lo, hi]. Used throughout to keep computed offsets
+ * within a segment's valid index range despite rounding/estimation. */
 static int32_t clamp_offset(int32_t v, int32_t lo, int32_t hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
 }
 
+/* Builds the full sorted, de-duplicated list of "ideal" shortcut offsets
+ * for a segment of length seg_len: always 0 and `end`, the midpoint
+ * (unless it coincides with an endpoint), plus up to K-2 interior
+ * offsets from plan_shortcut_offsets(). Writes into `offsets` (capacity
+ * `cap`) and returns the number of unique offsets written. Used by
+ * planned_gap_stats() to characterize the *ideal* shortcut spacing,
+ * independent of where shortcuts actually sit after mutations. */
 static int32_t collect_planned_anchor_offsets(int32_t seg_len, int32_t K,
                                               int32_t *offsets, int32_t cap) {
     if (cap <= 0 || seg_len <= 0) return 0;
@@ -281,6 +434,11 @@ static int32_t collect_planned_anchor_offsets(int32_t seg_len, int32_t K,
     return uniq;
 }
 
+/* Computes the mean and standard deviation of the gaps between
+ * consecutive *ideal* shortcut offsets in a segment of length seg_len.
+ * Used by estimate_step_slop() as a proxy for "how far apart are
+ * shortcuts typically spaced", to size the search window when walking
+ * from an estimated anchor toward a target node. */
 static void planned_gap_stats(int32_t seg_len, int32_t K,
                               double *avg_out, double *std_out) {
     int32_t *offs = malloc((K + 3) * sizeof(int32_t));
@@ -299,6 +457,12 @@ static void planned_gap_stats(int32_t seg_len, int32_t K,
     free(offs);
 }
 
+/* Returns the *ideal* offset for a single shortcut slot index `slot`
+ * within j->shortcuts[] (0 = segment_start, K-1 = segment_end, the
+ * slots in between are the interior shortcuts from
+ * plan_shortcut_offsets(), sorted ascending). Used when only one
+ * slot's planned position is needed, rather than the whole array
+ * (see collect_live_anchors's fallback path). */
 static int32_t shortcut_slot_planned_offset(int32_t seg_len, int32_t K, int32_t slot) {
     if (seg_len <= 1 || slot <= 0) return 0;
     int32_t end = seg_len - 1;
@@ -313,6 +477,13 @@ static int32_t shortcut_slot_planned_offset(int32_t seg_len, int32_t K, int32_t 
     return result;
 }
 
+/* Fills `slot_offsets[0..nslots-1]` with the ideal offset for every
+ * shortcut slot in one pass (slot 0 = 0, slot nslots-1 = end, interior
+ * slots from plan_shortcut_offsets()). Equivalent to calling
+ * shortcut_slot_planned_offset() for every slot but far cheaper, since
+ * it only computes plan_shortcut_offsets() once instead of once per
+ * slot. Used by estimate_target_node() to precompute offsets for every
+ * live shortcut in a segment before scoring anchors. */
 static void fill_shortcut_slot_offsets(int32_t seg_len, int32_t K,
                                        int32_t *slot_offsets, int32_t nslots) {
     if (!slot_offsets || nslots <= 0) return;
@@ -331,6 +502,16 @@ static void fill_shortcut_slot_offsets(int32_t seg_len, int32_t K,
     if (nslots > 1) slot_offsets[nslots-1] = end;
 }
 
+/* Maps a "planned" (ideal, as-built) offset onto an estimated "live"
+ * offset, given that the junction node currently sits at
+ * live_junction_offset instead of its original planned midpoint. This
+ * matters because inserts/deletes shift where things actually are
+ * without immediately rebuilding shortcuts; rather than assuming the
+ * old planned offsets are still accurate, this linearly rescales each
+ * half of the segment (before/after the midpoint) independently, using
+ * the junction node's live position as the new "center" anchor. Used
+ * only as an estimate — the caller (estimate_target_node) still walks
+ * pointers to confirm/correct it, bounded by estimate_step_slop(). */
 static int32_t map_planned_offset_to_live(int32_t seg_len, int32_t live_junction_offset,
                                           int32_t planned_offset) {
     if (seg_len <= 1) return 0;
@@ -345,6 +526,13 @@ static int32_t map_planned_offset_to_live(int32_t seg_len, int32_t live_junction
     return clamp_offset(live + (int32_t)lround((double)(target-mid)*(double)(end-live)/(double)(end-mid)), 0, end);
 }
 
+/* Estimates how much extra walking slack ("slop") to allow beyond the
+ * naive step_goal when walking from a lower-bound anchor toward
+ * target_offset, to absorb the imprecision of
+ * map_planned_offset_to_live()'s linear rescaling. Scales the
+ * (avg_gap + std_gap) shortcut spacing by how stretched the relevant
+ * half of the segment is relative to its planned proportions, and
+ * always allows at least 1 extra step. */
 static int32_t estimate_step_slop(int32_t seg_len, int32_t ref_junction_offset,
                                   int32_t target_offset, double avg_gap, double std_gap) {
     if (seg_len <= 1) return 0;
@@ -360,6 +548,10 @@ static int32_t estimate_step_slop(int32_t seg_len, int32_t ref_junction_offset,
     return (int32_t)ceil(slop);
 }
 
+/* Appends `node` (with its estimated offset) to the anchors array if
+ * it isn't already present and there's room; no-op for a NULL node.
+ * Returns the (possibly unchanged) count `n`. Used to build a
+ * deduplicated candidate anchor list in collect_live_anchors(). */
 static int32_t anchor_push_unique(AnchorRef *anchors, int32_t n, int32_t cap,
                                   Node *node, int32_t est_offset) {
     if (!node || n >= cap) return n;
@@ -368,6 +560,9 @@ static int32_t anchor_push_unique(AnchorRef *anchors, int32_t n, int32_t cap,
     return n + 1;
 }
 
+/* Insertion sort of anchors by node value ascending (ties broken by
+ * estimated offset). n is always small (bounded by K+few), so O(n^2)
+ * is fine. */
 static void sort_anchors_by_value(AnchorRef *anchors, int32_t n) {
     for (int32_t i = 1; i < n; i++) {
         AnchorRef cur = anchors[i]; int32_t j = i-1;
@@ -382,6 +577,17 @@ static void sort_anchors_by_value(AnchorRef *anchors, int32_t n) {
     }
 }
 
+/* Gathers a deduplicated, value-sorted list of candidate "anchor"
+ * nodes within junction j's segment: segment_start (offset 0), the
+ * junction node itself (unless it's the node being skipped, e.g.
+ * because it was just deleted), every live shortcut (with its
+ * estimated live offset via map_planned_offset_to_live, using
+ * slot_offsets if precomputed or falling back to
+ * shortcut_slot_planned_offset per-shortcut otherwise), and
+ * segment_end (offset = end). `skip` lets the caller exclude a
+ * specific node (typically one mid-deletion) from being used as an
+ * anchor. Returns the number of anchors written into `anchors`
+ * (capacity `cap`), sorted ascending by node value. */
 static int32_t collect_live_anchors(const Junction *j, int32_t K, Node *skip,
                                     const int32_t *slot_offsets,
                                     int32_t ref_junction_offset,
@@ -407,6 +613,35 @@ static int32_t collect_live_anchors(const Junction *j, int32_t K, Node *skip,
     return n;
 }
 
+/* Core estimator: given a junction j and a target key (target_value,
+ * with target_offset as its estimated live position within the
+ * segment), returns the Node in the segment closest to where target
+ * should be inserted/found — i.e. the node the caller should start
+ * walking from, rather than always starting at segment_start.
+ *
+ * Algorithm:
+ *   1. Compute planned_gap_stats() to characterize typical shortcut
+ *      spacing (used to size the walk-slop allowance).
+ *   2. Precompute live offsets for every shortcut slot
+ *      (fill_shortcut_slot_offsets), bounded by MAX_ESTIMATE_WINDOW to
+ *      avoid unbounded work on segments with an unusually large K.
+ *   3. Collect all candidate anchors (collect_live_anchors) and find
+ *      the tightest bracket [lower, upper] around target_value by
+ *      value (not by walking the list — anchors are already sorted).
+ *   4. Walk forward from `lower` toward `upper`, staging visited nodes
+ *      into a fixed-size buffer, up to (step_goal + slop) steps or
+ *      MAX_ESTIMATE_WINDOW nodes, whichever comes first. If we
+ *      "overshoot" target_value before reaching `upper`, that's a
+ *      signal the linear offset estimate was off; in that case (or if
+ *      we do reach `upper`) we don't trust the exact stepped-to
+ *      position and instead return the middle of what we've staged,
+ *      which is still a much better starting point than segment_start.
+ *   5. Otherwise (no overshoot, walk_limit reached cleanly) return the
+ *      node at the estimated step_goal position.
+ *
+ * This function never fails outright — on allocation failure it falls
+ * back to segment_start/segment_end so callers can always proceed with
+ * a normal linear walk. */
 static Node *estimate_target_node(Junction *j, int32_t K, Node *skip,
                                   int32_t ref_junction_offset,
                                   int32_t target_value, int32_t target_offset) {
@@ -485,6 +720,24 @@ static Node *estimate_target_node(Junction *j, int32_t K, Node *skip,
 /* ═══════════════════════════════════════════════════════════════════════
    BUILD SHORTCUTS  (unchanged)
    ═══════════════════════════════════════════════════════════════════════ */
+/* (Re)builds junction j's shortcut array and junction node from scratch
+ * by walking the segment once, given its (possibly just-changed)
+ * length seg_len. This is the "ground truth" rebuild used whenever a
+ * segment's shortcuts can no longer be trusted to be well-positioned
+ * (e.g. after local_rebuild, merges, or an off-center junction node).
+ *
+ * Steps:
+ *   1. Plan interior offsets via plan_shortcut_offsets() and sort them.
+ *   2. Determine total shortcut count: 2 endpoints + interior offsets,
+ *      clamped to exactly K (padding with segment_start if short).
+ *   3. Single walk from segment_start to segment_end, recording:
+ *        - the node at the planned junction offset (new `node`),
+ *        - the node at each planned interior offset (into shortcuts[]).
+ *   4. Fill any unused interior slots with segment_start (defensive —
+ *      only happens if n_int came up short) and always set the last
+ *      slot to segment_end.
+ * Mutates j->shortcuts, j->shortcuts_len, j->node, j->junction_offset,
+ * and j->segment_len in place. */
 static void build_shortcuts(Junction *j, int32_t seg_len, int32_t K) {
     j->shortcuts_len = 0;
     int32_t junc_off = (seg_len > 1) ? (seg_len-1)/2 : 0;
@@ -522,6 +775,9 @@ static void build_shortcuts(Junction *j, int32_t seg_len, int32_t K) {
 /* ═══════════════════════════════════════════════════════════════════════
    JUNCTION ARRAY & SKIP LIST (unchanged except RNG)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Appends junction j to jli->junctions[], growing the array (doubling,
+ * starting at 16) if needed. On allocation failure, frees j and
+ * returns false so the caller can unwind; on success, returns true. */
 static bool junc_arr_push(JLI *jli, Junction *j) {
     if (jli->num_junctions >= jli->junctions_cap) {
         int32_t newcap = jli->junctions_cap ? jli->junctions_cap * 2 : 16;
@@ -537,6 +793,12 @@ static bool junc_arr_push(JLI *jli, Junction *j) {
     return true;
 }
 
+/* Rebuilds the prev_junction/next_junction doubly-linked ring over all
+ * junctions to match the current jli->junctions[] array order. Must be
+ * called after any operation that changes the junction array's shape
+ * (insert/remove/reorder) — mutation callers that touch a single
+ * junction in place without resizing may skip it, but anything that
+ * shifts the array (dissolves, merges, region rebuilds) calls this. */
 static void junc_relink(JLI *jli) {
     int32_t n = jli->num_junctions;
     for (int32_t i = 0; i < n; i++) {
@@ -545,6 +807,12 @@ static void junc_relink(JLI *jli) {
     }
 }
 
+/* Generates a random skip-list level in [0, max_level-1] using
+ * jli_rng_state (xorshift64), with each level having independent
+ * probability `p` of "leveling up" from the one below — i.e. a
+ * geometric distribution truncated at max_level-1. Degenerate cases:
+ * max_level<=1 or p<=0 always returns 0 (no extra levels); p>=1.0
+ * always returns the max possible level. */
 static uint8_t random_level(int max_level, double p) {
     uint8_t lvl = 0;
     if (max_level <= 1 || p <= 0.0) return 0;
@@ -565,6 +833,11 @@ static uint8_t random_level(int max_level, double p) {
    BLOCK STRUCTURE & SKIP‑LIST (now with live range & index)
    ═══════════════════════════════════════════════════════════════════════ */
 
+/* Allocates an empty JunctionBlock with room for `capacity` junction
+ * pointers. `index` starts at -1 (unset — the caller is responsible
+ * for assigning its real position once it's inserted into
+ * jli->blocks[]). On partial allocation failure, cleans up and
+ * returns NULL. */
 static JunctionBlock *block_new(int32_t capacity) {
     JunctionBlock *b = calloc(1, sizeof(JunctionBlock));
     if (!b) return NULL;
@@ -581,6 +854,9 @@ static JunctionBlock *block_new(int32_t capacity) {
     return b;
 }
 
+/* Frees a JunctionBlock and its owned arrays (the junction-pointer
+ * array and the skip-list forward-pointer array). Does NOT free the
+ * Junctions it points to — those are owned by jli->junctions[]. */
 static void block_free(JunctionBlock *b) {
     if (b) {
         free(b->junctions);
@@ -590,6 +866,13 @@ static void block_free(JunctionBlock *b) {
 }
 
 /* build blocks from current junctions array (greedy, up to hard_max) */
+/* Discards all existing blocks and repartitions the current
+ * jli->junctions[] array into fresh blocks, greedily filling each one
+ * up to block_hard_max before starting the next. Grows jli->blocks[]
+ * if needed. This is the full "from scratch" block build used after a
+ * global rebuild or whenever build_junctions() runs; incremental
+ * mutations instead use rebuild_blocks_for_region() to avoid redoing
+ * this work for the whole structure. */
 static void build_blocks(JLI *jli) {
     for (int32_t i = 0; i < jli->num_blocks; i++) block_free(jli->blocks[i]);
     jli->num_blocks = 0;
@@ -620,6 +903,17 @@ static void build_blocks(JLI *jli) {
 }
 
 /* skip‑list over blocks (uses live range via junctions[0] and junctions[count-1]) */
+/* Rebuilds the entire block-level skip list from scratch: assigns each
+ * block a fresh random level (random_level()), reallocates its
+ * next_skip[] forward-pointer array to match, then links every block
+ * into every level <= its own level by walking blocks in array order
+ * (which is value-sorted) and threading a `last[level]` pointer per
+ * level. block_skip_heads[level] becomes the first block present at
+ * that level.
+ *
+ * If the `last` bookkeeping array itself fails to allocate, this falls
+ * back to forcing every block to level 0 (a plain linked scan with no
+ * skip levels) rather than leaving the skip list half-built. */
 static void build_block_skip_list(JLI *jli) {
     int max_lvl = jli->max_skip_level;
     for (int32_t i = 0; i <= max_lvl; i++) jli->block_skip_heads[i] = NULL;
@@ -682,6 +976,12 @@ static void build_block_skip_list(JLI *jli) {
  * keep walking forward from wherever the previous (higher) level's excursion left
  * off, since that excursion may have overshot past a valid block reachable only from
  * the lower level's own head. */
+/* Walks the block skip list top-down to find the last block whose
+ * range could still contain `target` — i.e. the entry point for a
+ * within-block search. Increments *steps (if non-NULL) once per block
+ * visited/advanced-to, for instrumentation. See the detailed comment
+ * above for why this needs extra care in the absence of a sentinel
+ * head node. Returns NULL only if jli has no blocks at all. */
 static JunctionBlock *block_skip_search(JLI *jli, int32_t target, int64_t *steps) {
     if (jli->num_blocks == 0) return NULL;
     int max_lvl = jli->max_skip_level;
@@ -718,6 +1018,15 @@ static JunctionBlock *block_skip_search(JLI *jli, int32_t target, int64_t *steps
 }
 
 /* within a block, locate the junction whose segment contains target, and optionally its index */
+/* Binary search within a single block's junctions[] array for the
+ * junction whose [segment_start, segment_end] range brackets `target`.
+ * If out_idx is non-NULL, writes the matching junction's index within
+ * the block. Returns NULL if no junction in this block covers target
+ * (i.e. target falls in a gap — shouldn't normally happen for values
+ * that exist in the list, since segments are contiguous, but can occur
+ * when searching for a non-existent value). The `hi >= 0` fallback
+ * check after the loop catches the case where standard binary search
+ * converges just past the correct bucket. */
 static Junction *block_find_junction_and_idx(JunctionBlock *b, int32_t target, int32_t *out_idx) {
     if (!b || b->count == 0) return NULL;
     int32_t lo = 0, hi = b->count - 1;
@@ -743,11 +1052,20 @@ static Junction *block_find_junction_and_idx(JunctionBlock *b, int32_t target, i
     return NULL;
 }
 
+/* Convenience wrapper over block_find_junction_and_idx() for callers
+ * that don't need the index. */
 static Junction *block_find_junction(JunctionBlock *b, int32_t target) {
     return block_find_junction_and_idx(b, target, NULL);
 }
 
 /* O(1) removal of a junction from its block, given its index (if known) */
+/* Removes junction j from block bk. If known_idx (its index within the
+ * block) is already known from a prior search, this is O(remaining
+ * elements in block) for the memmove and O(1) for the lookup;
+ * otherwise it falls back to a linear scan of the block first. If
+ * removal empties the block, the block itself is freed and spliced out
+ * of jli->blocks[] (using its cached `index`), and every subsequent
+ * block's `index` is shifted down by one to stay accurate. */
 static void block_remove_junction_at(JLI *jli, Junction *j, JunctionBlock *bk, int32_t known_idx) {
     if (!bk || bk->count == 0) return;
     int32_t idx = known_idx;
@@ -783,6 +1101,19 @@ static void block_remove_junction_at(JLI *jli, Junction *j, JunctionBlock *bk, i
 /* ═══════════════════════════════════════════════════════════════════════
    BUILD FROM SORTED (now wires blocks with index)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Full "global rebuild" of the junction layer from the current linked
+ * list (jli->head), assumed already sorted. Frees all existing
+ * junctions and blocks, then walks the list once, carving it into
+ * fixed-size segments of jli->segment_size (the last segment may be
+ * shorter) and building a fresh Junction — including its shortcuts and
+ * junction node, computed inline rather than via build_shortcuts() —
+ * for each one. Finishes by relinking the junction ring
+ * (junc_relink), repartitioning into blocks (build_blocks), and
+ * rebuilding the block skip list (build_block_skip_list).
+ *
+ * If junc_arr_push() ever fails (OOM) partway through, everything
+ * built so far is torn down and the JLI is left with zero junctions/
+ * blocks rather than a partially-built, inconsistent state. */
 static void build_junctions(JLI *jli) {
     for (int32_t i = 0; i < jli->num_junctions; i++) junction_free(jli->junctions[i]);
     jli->num_junctions = 0;
@@ -852,6 +1183,11 @@ static void build_junctions(JLI *jli) {
     build_block_skip_list(jli);
 }
 
+/* Public entry point: replaces the entire contents of jli with a fresh
+ * linked list built from `values[0..n-1]`, which the caller must
+ * already have sorted ascending (this function does not sort). Frees
+ * the previous list, then delegates to build_junctions() to
+ * (re)construct the junction/block layers on top of it. */
 void jli_build_from_sorted(JLI *jli, const int32_t *values, int32_t n) {
     Node *c = jli->head;
     while (c) { Node *nx = c->next; free(c); c = nx; }
@@ -870,6 +1206,26 @@ void jli_build_from_sorted(JLI *jli, const int32_t *values, int32_t n) {
 /* ═══════════════════════════════════════════════════════════════════════
    SEARCH (uses live range)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Public read-only search for `target`. Returns the matching Node, or
+ * NULL if not present. Records the step count into
+ * jli->last_search_steps for benchmarking, and caches the containing
+ * junction into jli->last_junction on success.
+ *
+ * Path:
+ *   1. block_skip_search() to find the candidate block in expected
+ *      O(log num_blocks) via the block skip list.
+ *   2. Bounds-check target against that block's live range; bail out
+ *      early if it falls outside (list doesn't contain it).
+ *   3. block_find_junction() binary-searches within the block for the
+ *      junction whose segment covers target.
+ *   4. Fast path: if the junction's own node already matches, return
+ *      immediately.
+ *   5. Otherwise binary search the junction's shortcuts[] array to
+ *      find the tightest known lower bound (best_idx), then walk
+ *      forward node-by-node from there (also considering j->node as a
+ *      possibly-tighter starting point) until we hit target, pass it
+ *      (not found), or run out of segment. __builtin_prefetch hints
+ *      the next node's cache line during this walk. */
 Node *jli_search(JLI *jli, int32_t target) {
     int64_t steps = 0;
     jli->search_count++;
@@ -948,6 +1304,25 @@ Node *jli_search(JLI *jli, int32_t target) {
 /* ═══════════════════════════════════════════════════════════════════════
    MUTATION SEARCH (extended result with block info)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Result of a mutation-oriented search: unlike jli_search() (which
+ * only needs to answer "is it present"), insert/delete need the
+ * surrounding splice points and enough context to update the junction/
+ * block layers without re-searching from scratch.
+ *   prev / cur : cur is the first node with value >= target (or NULL
+ *                if target would go at the very end); prev is the
+ *                node immediately before it (or NULL if cur is head).
+ *                This is exactly the pair needed to splice a new node
+ *                in, or to identify cur as the node to delete if
+ *                cur->value == target.
+ *   j          : the junction whose segment contains this splice
+ *                point (or the nearest one, in edge-of-list cases).
+ *   block / bi / ji : if the junction was located via the block skip-
+ *                list path, these cache which block/index it came
+ *                from, so callers like jli_delete can remove it from
+ *                its block in O(1) instead of re-scanning all blocks.
+ *                Left as NULL/-1/-1 when the fallback binary-search-
+ *                over-junctions path was used instead (no block info
+ *                available in that path). */
 typedef struct {
     Node *prev;
     Node *cur;
@@ -957,6 +1332,12 @@ typedef struct {
     int32_t ji;             /* index of the junction inside the block */
 } MutResult;
 
+/* Fallback: plain O(n) linear walk of the raw linked list to find the
+ * splice point for `target`, used when the junction/block layers are
+ * absent, inconsistent, or a bounded walk elsewhere gave up. Includes
+ * a runaway-loop guard (aborts with a diagnostic if it walks more than
+ * length+10 steps, which should be structurally impossible for a
+ * well-formed list but guards against a corrupted `next` chain). */
 static MutResult linear_scan(JLI *jli, int32_t target) {
     MutResult r = {NULL, jli->head, NULL, NULL, -1, -1};
     int64_t steps = 0;
@@ -973,6 +1354,34 @@ static MutResult linear_scan(JLI *jli, int32_t target) {
     return r;
 }
 
+/* Core search used by both jli_insert() and jli_delete() to locate the
+ * splice point for `target`, along with the owning junction and (where
+ * available) its block context — see MutResult's field comments above.
+ *
+ * Path, roughly mirroring jli_search() but returning richer state and
+ * being tolerant of `target` not being present:
+ *   1. block_skip_search() to find the candidate block.
+ *   2. If the target falls outside that block's own junctions but
+ *      still could belong to an adjacent junction/block (edge cases:
+ *      target is just below the block's first junction or just above
+ *      its last), step to the neighboring junction/block as needed.
+ *   3. Once a candidate junction cj is settled and target falls inside
+ *      its live [segment_start, segment_end] range: binary-search its
+ *      shortcuts (and consider j->node) for the tightest lower bound,
+ *      then walk forward from there up to a bounded number of steps
+ *      (segment_len + 5); if that bound is exceeded (shortcuts/segment
+ *      state is somehow inconsistent with segment_len), give up and
+ *      fall back to a full linear_scan() rather than risk a wrong
+ *      answer.
+ *   4. If the block path didn't yield a usable candidate at all, fall
+ *      back to a binary search directly over jli->junctions[] (no
+ *      block info available in this path, so MutResult.block/bi stay
+ *      unset), with the same shortcut-search-then-walk logic.
+ *   5. If binary search over junctions also fails to bracket target
+ *      inside any single junction's range, target falls in a
+ *      between-junctions gap; use whichever of the two bracketing
+ *      junctions is appropriate to report prev/cur, or fall back to
+ *      linear_scan() for the remaining edge cases. */
 static MutResult mutation_search(JLI *jli, int32_t target) {
     int64_t steps = 0;
     MutResult empty = {NULL, NULL, NULL, NULL, -1, -1};
@@ -1180,6 +1589,34 @@ static void suboptimal_rebuild_step(JLI *jli, int32_t *flagged, int32_t nf);
 /* ═══════════════════════════════════════════════════════════════════════
    INSERT  (no more block_update_range_if_boundary)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Public insert. Returns false without modifying anything if `value`
+ * is already present (no duplicates); otherwise splices a new node in
+ * and returns true.
+ *
+ * Special case: if the list is currently empty, just create the first
+ * node and do a full build_junctions() (there's nothing incremental to
+ * update yet).
+ *
+ * Normal case:
+ *   1. mutation_search() locates the splice point and owning junction.
+ *   2. Splice the new node in between m.prev and m.cur.
+ *   3. Patch up the owning junction j's bookkeeping in O(1) depending
+ *      on where the insert landed:
+ *        - before the old segment_start (or list head) → new node
+ *          becomes the segment_start (and shortcuts[0] if that
+ *          shortcut pointed at the old start); junction_offset and
+ *          segment_len both grow by 1 since everything shifted right.
+ *        - after the old segment_end → new node becomes segment_end
+ *          (and the last shortcut slot); only segment_len grows.
+ *        - in the interior → just segment_len grows, plus
+ *          junction_offset grows by 1 if the insert landed before the
+ *          junction node (shifting its position).
+ *      (Shortcuts in the interior are deliberately NOT updated here —
+ *      they go gradually stale until a maintenance pass notices and
+ *      rebuilds them; see should_rebuild/local_rebuild.)
+ *   4. If enable_rebuild, bump the maintenance counters and let
+ *      maintenance_hook() decide whether a local/suboptimal/global
+ *      rebuild is due. */
 bool jli_insert(JLI *jli, int32_t value, void *payload) {
     Node *nn = node_new(value, payload);
     if (!jli->head) {
@@ -1222,6 +1659,25 @@ bool jli_insert(JLI *jli, int32_t value, void *payload) {
 /* ═══════════════════════════════════════════════════════════════════════
    DELETE  (uses cached block info to avoid scans)
    ═══════════════════════════════════════════════════════════════════════ */
+/* Finds an approximate midpoint node strictly between `left` and
+ * `right` (both assumed to lie within junction j's segment), used to
+ * pick a replacement junction node or shortcut after the previous one
+ * is deleted, without doing a full build_shortcuts() rebuild.
+ *
+ * Primary approach: Floyd-style slow/fast pointer walk from `left`
+ * (fast moves 2 steps per iteration, slow moves 1) bounded by
+ * `max_steps` derived from segment_len, so slow lands near the
+ * midpoint between left and right when fast reaches (or passes) right.
+ *
+ * Fallback (if the fast/slow walk doesn't cleanly terminate within
+ * max_steps, e.g. because right isn't actually reachable from left
+ * within the expected bound): a plain count-then-walk-halfway pass
+ * between left and right->next.
+ *
+ * Either way, the result is validated to actually lie strictly between
+ * left and right by value before being returned; if not, it falls back
+ * to returning `left` itself, letting the caller detect the
+ * degenerate case and trigger a full build_shortcuts() instead. */
 static Node *safe_middle_between(Junction *j, Node *left, Node *right) {
     if (!left || !right) return left ? left : right;
     int32_t max_steps = (j->segment_len > 0 ? j->segment_len : 100) + 10;
@@ -1252,6 +1708,46 @@ static Node *safe_middle_between(Junction *j, Node *left, Node *right) {
     return slow;
 }
 
+/* Public delete. Returns false without modifying anything if `value`
+ * isn't present; otherwise removes it and returns true.
+ *
+ * High-level flow:
+ *   1. mutation_search() locates the node and its junction.
+ *   2. Splice it out of the raw linked list.
+ *   3. If the list is now empty, tear down all junctions/blocks and
+ *      return early.
+ *   4. Otherwise patch the owning junction j:
+ *        - if the deleted node was segment_start/segment_end/a
+ *          shortcut, repoint those fields at the appropriate neighbor.
+ *        - adjust junction_offset if the deletion happened before the
+ *          junction node (shifting its position left by one).
+ *        - segment_len shrinks by 1.
+ *   5. If j->segment_len has dropped to <= 2, the segment is too small
+ *      to be worth keeping on its own: "dissolve" it — either merge it
+ *      into a neighboring junction (extending that junction's segment
+ *      to absorb this one's remaining nodes and rebuilding its
+ *      shortcuts), or, if it's now truly empty (segment_len == 0),
+ *      simply splice it out of the list and remove the junction
+ *      entirely with no merge target needed. This path updates the
+ *      block layer directly (block_remove_junction_at) rather than
+ *      going through the general per-op maintenance counters, and
+ *      jumps via `goto skip_update` to the shared relink+skip-list-
+ *      rebuild tail once done.
+ *   6. Otherwise (segment_len still > 2, normal case): if the deleted
+ *      node was the junction node itself, find a new one via
+ *      safe_middle_between() (falling back to a full
+ *      build_shortcuts() if that doesn't yield something valid);
+ *      similarly, if it was an interior shortcut, try to patch just
+ *      that one slot via safe_middle_between() between its neighbors,
+ *      falling back to a full rebuild if that's not clean either.
+ *      Then bump maintenance counters and let maintenance_hook() run
+ *      as usual.
+ *
+ * `skip_update:` is reached only by the dissolve/merge path (step 5)
+ * and performs the bookkeeping common to both of its sub-cases:
+ * clearing the search cache, relinking the junction ring, and fully
+ * rebuilding the block skip list (needed because dissolve/merge can
+ * change which junctions exist, not just their contents). */
 bool jli_delete(JLI *jli, int32_t value) {
     MutResult m = mutation_search(jli, value);
     if (!m.cur || m.cur->value != value) return false;
@@ -1459,7 +1955,27 @@ skip_update:
 
 /* ═══════════════════════════════════════════════════════════════════════
    MAINTENANCE  (now with local block rebuild)
-   ═══════════════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════════════
+   Three tiers of maintenance, cheapest to most expensive:
+     - local_rebuild        : re-shortcut ONE junction whose node has
+                               drifted too far from center (see
+                               should_rebuild). O(segment_len).
+     - suboptimal_rebuild_step : re-partition a contiguous RANGE of
+                               junctions whose segment lengths have
+                               drifted too far from segment_size.
+                               O(size of the affected region).
+     - perform_global_rebuild : throw away everything and rebuild from
+                               the raw list via build_junctions().
+                               O(n). Used only as a last resort when
+                               the other two tiers can't keep up.
+   maintenance_hook() (further below) decides which tier(s) to run,
+   based on op counters and periodic scans. */
+
+/* Re-derives junction j's shortcuts/junction-node from scratch (via
+ * build_shortcuts) because its junction node has drifted too far off
+ * center (see should_rebuild). Also tallies how many nodes were
+ * touched (walked) doing so, into jli->local_rebuild_node_touches, for
+ * benchmarking/instrumentation. */
 static void local_rebuild(JLI *jli, Junction *j, int32_t seg_len) {
     if (seg_len <= 1) return;
     int64_t touches = 0;
@@ -1474,6 +1990,19 @@ static void local_rebuild(JLI *jli, Junction *j, int32_t seg_len) {
     jli->local_rebuild_events++;
 }
 
+/* Decides whether junction j's junction node has drifted far enough
+ * off-center to warrant a local_rebuild(). Compares
+ * junction_offset/segment_len (the node's position as a fraction of
+ * the segment) against 0.5 ± t_j — i.e. t_j is a tolerance band around
+ * the ideal midpoint; drifting outside that band triggers a rebuild.
+ *
+ * Defensive path: if junction_offset looks stale/out-of-range (e.g.
+ * negative or >= segment_len, which can happen after a run of edits
+ * whose incremental bookkeeping didn't perfectly track it), this
+ * re-derives it by walking the segment to find where `node` actually
+ * is; if `node` isn't found in the segment at all (shouldn't normally
+ * happen), it conservatively reports "no rebuild needed" rather than
+ * risk acting on bad data. */
 static bool should_rebuild(Junction *j, double t_j) {
     int32_t total = j->segment_len;
     if (total <= 1 || !j->node) return false;
@@ -1494,6 +2023,10 @@ static bool should_rebuild(Junction *j, double t_j) {
     return (ratio < 0.5 - t_j) || (ratio > 0.5 + t_j);
 }
 
+/* The "local" maintenance pass: scans every junction and local-
+ * rebuilds any whose junction node has drifted off-center per
+ * should_rebuild(). Triggered periodically by maintenance_hook() based
+ * on jli->local_interval mutations having occurred. */
 static void maintenance_step(JLI *jli) {
     for (int32_t i = 0; i < jli->num_junctions; i++) {
         Junction *j = jli->junctions[i];
@@ -1502,6 +2035,18 @@ static void maintenance_step(JLI *jli) {
     jli->local_scan_counter++;
 }
 
+/* Scans every junction's segment_len against the target segment_size
+ * and classifies its relative drift:
+ *   drift = |segment_len - segment_size| / segment_size
+ * Junctions with drift >= hard_pct go into *hard_out (severely
+ * oversized/undersized); junctions with drift >= soft_pct (but below
+ * hard_pct) go into *flagged_out only. Every hard-flagged junction is
+ * also included in *flagged_out, so *flagged_out is always a superset
+ * of *hard_out. *seg_ratio is the fraction of all junctions that were
+ * flagged (soft or hard) — a coarse "how out of shape is the whole
+ * structure" signal used by maintenance_hook() to decide whether
+ * suboptimal rebuilds are keeping up or a global rebuild is needed.
+ * Caller owns and must free() *flagged_out and *hard_out. */
 static void scan_suboptimal(JLI *jli, int32_t **flagged_out, int32_t *nf,
                              int32_t **hard_out, int32_t *nh, double *seg_ratio) {
     int32_t n = jli->num_junctions;
@@ -1519,6 +2064,11 @@ static void scan_suboptimal(JLI *jli, int32_t **flagged_out, int32_t *nf,
     *seg_ratio = n > 0 ? (double)*nf / n : 0.0;
 }
 
+/* The heaviest maintenance tier: throws away the entire junction/block
+ * layer and rebuilds it from scratch off the raw sorted list via
+ * build_junctions(). Resets the maintenance-depth guard and all
+ * per-interval operation counters (since everything is now freshly
+ * optimal), and bumps global_rebuild_events for instrumentation. */
 static void perform_global_rebuild(JLI *jli) {
     jli->maintenance_depth = 0;
     build_junctions(jli);
@@ -1532,6 +2082,19 @@ static void perform_global_rebuild(JLI *jli) {
  * New helper: rebuild only the blocks that intersect the junction range [si, ei].
  * The new junctions (new_js, count new_count) are packed into fresh blocks
  * according to the hard_max rule, and the block array is spliced in place.
+ *
+ * Summary of the 4 phases below:
+ *   1. Identify every block containing at least one of old_js (by
+ *      pointer identity, not value — see inline comment) and collect
+ *      any "survivor" junctions in those blocks that aren't part of
+ *      this rebuild, so they aren't lost when the block is discarded.
+ *   2. Merge survivors back in around new_js (preserving ascending
+ *      order) and pack the result into fresh blocks up to
+ *      block_hard_max each.
+ *   3. Splice the new blocks into jli->blocks[] in place of every
+ *      matched block, compacting out gaps — this is correct even when
+ *      matched blocks aren't contiguous in the array.
+ *   4. Renumber every block's `index` field to match its new position.
  */
 static void rebuild_blocks_for_region(JLI *jli, Junction **old_js, int32_t old_count,
                                        Junction **new_js, int32_t new_count) {
@@ -1693,6 +2256,35 @@ static void rebuild_blocks_for_region(JLI *jli, Junction **old_js, int32_t old_c
     if (merged_new_js != new_js) free(merged_new_js);
 }
 
+/* The "suboptimal" (mid-tier) maintenance pass: given a sorted array
+ * of flagged junction indices (`flagged`, count `nf`, from
+ * scan_suboptimal), groups them into contiguous runs ("regions"),
+ * then for each region (processed back-to-front so earlier indices
+ * stay valid as later regions shift the array) re-partitions that
+ * region's total node count into fresh, evenly-sized segments of
+ * ~segment_size each and rebuilds junctions for them from scratch.
+ *
+ * Per region:
+ *   - If the region's total length L is below min_reg (too small to
+ *     be worth repartitioning on its own), grow it by pulling in one
+ *     neighboring junction (prefer the one before, else the one
+ *     after) before proceeding.
+ *   - Compute how many new segments are needed and their sizes
+ *     (seg_sizes), walk the region's nodes once, and build a fresh
+ *     Junction (with shortcuts) for each new segment.
+ *   - Splice the new junctions into jli->junctions[] in place of the
+ *     old range [si, ei], growing the array first if the new count
+ *     exceeds the old count.
+ *   - Delegate to rebuild_blocks_for_region() to patch the block
+ *     layer, then only AFTER that call free the old junctions — see
+ *     the inline comment at that point for why the ordering matters
+ *     (the blocks still reference the old junctions until
+ *     rebuild_blocks_for_region has replaced those references).
+ *
+ * After all regions are processed: relinks the junction ring
+ * (junc_relink) and does a full block-skip-list rebuild (cheaper to
+ * just redo it globally than to patch it incrementally, since
+ * potentially many blocks changed). */
 static void suboptimal_rebuild_step(JLI *jli, int32_t *flagged, int32_t nf) {
     if (nf == 0) return;
     int32_t seg_size = jli->segment_size;
@@ -1786,6 +2378,43 @@ static void suboptimal_rebuild_step(JLI *jli, int32_t *flagged, int32_t nf) {
     jli->suboptimal_rebuild_events++;
 }
 
+/* Called after every mutation (when enable_rebuild is set) to decide
+ * whether any maintenance tier is due, and run it. Two independent
+ * triggers, checked in order:
+ *
+ *   1. Local tier — if local_ops_counter has reached local_interval:
+ *      normally runs maintenance_step() (local_rebuild on drifted
+ *      junctions) and resets the counter. EXCEPT: if a suboptimal
+ *      scan is imminent (within `stop_crash_local_sub` fraction of
+ *      sub_interval), skip running local maintenance this time and
+ *      only partially reset the counter (to local_interval/2) — this
+ *      avoids doing local work that's likely about to be superseded
+ *      by an imminent, more thorough suboptimal pass.
+ *
+ *   2. Suboptimal tier — if sub_ops_counter has reached sub_interval:
+ *      run scan_suboptimal() to classify drift across all junctions.
+ *        - If the *hard*-drift ratio already exceeds
+ *          emergency_hard_segment_ratio, skip straight to a global
+ *          rebuild (the structure is bad enough that a global rebuild
+ *          is more effective than trying to patch it regionally).
+ *        - Else if the *soft-or-hard* flagged ratio exceeds
+ *          flagged_ratio_limit, run suboptimal_rebuild_step() over all
+ *          flagged junctions.
+ *        - Else if there's at least one hard-drifted junction (but not
+ *          enough to hit flagged_ratio_limit), still run
+ *          suboptimal_rebuild_step() but scoped to just the hard ones.
+ *        - Track how many suboptimal rebuilds have fired since the
+ *          last global rebuild (sub_event_before_global); once that
+ *          count reaches min_suboptimal_events_before_global AND the
+ *          flagged ratio is STILL >= max_suboptimal_segments (i.e.
+ *          suboptimal rebuilds aren't converging fast enough), escalate
+ *          to a global rebuild instead of continuing to chip away
+ *          regionally.
+ *
+ * maintenance_depth guards against unbounded reentrant recursion (a
+ * rebuild triggering further rebuilds); it's incremented on entry and
+ * decremented on every exit path, and the function refuses to do any
+ * work at all past depth 10, logging instead. */
 static void maintenance_hook(JLI *jli) {
     if (jli->maintenance_depth > 10) {
         fprintf(stderr, "maintenance_hook recursion depth exceeded (%d)\n", jli->maintenance_depth);
@@ -1848,6 +2477,14 @@ static void maintenance_hook(JLI *jli) {
 /* ═══════════════════════════════════════════════════════════════════════
    LIFECYCLE
    ═══════════════════════════════════════════════════════════════════════ */
+/* Constructs and returns a new, empty JLI configured with the given
+ * tunables (see the JLI struct's field comments and
+ * validate_jli_parameters for what each one controls). Parameters are
+ * validated first (validate_jli_parameters aborts the process on
+ * invalid input); most numeric parameters that are <= 0 fall back to a
+ * sane default rather than being rejected outright (segment_size,
+ * shortcuts_per_junc, max_skip_level, local_interval, sub_interval,
+ * block_size). Returns NULL on allocation failure. */
 JLI *jli_create(int32_t segment_size,
                 int32_t shortcuts_per_junc,
                 int32_t max_skip_level,
@@ -1907,6 +2544,10 @@ JLI *jli_create(int32_t segment_size,
     return jli;
 }
 
+/* Frees an entire JLI: every list node, every junction, every block,
+ * the block skip-list head array, and finally the JLI struct itself.
+ * Safe to call with jli == NULL (no-op). Does not free node payloads —
+ * those remain the caller's responsibility. */
 void jli_destroy(JLI *jli) {
     if (!jli) return;
     Node *c = jli->head;
@@ -1919,8 +2560,13 @@ void jli_destroy(JLI *jli) {
     free(jli);
 }
 
+/* Returns the number of elements currently stored, or 0 for a NULL jli. */
 int32_t jli_size(JLI *jli) { return jli ? jli->length : 0; }
 
+/* Estimates total heap memory used by the structure itself (JLI struct
+ * + every Node + junction array/structs/shortcuts + block array/
+ * structs/skip-pointers), NOT including any external node payloads.
+ * Used for the paper's memory/speed trade-off measurements. */
 static int64_t jli_memory_bytes(JLI *jli) {
     int64_t bytes = (int64_t)sizeof(JLI);
     bytes += (int64_t)jli->length * sizeof(Node);
@@ -1941,12 +2587,20 @@ static int64_t jli_memory_bytes(JLI *jli) {
     return bytes;
 }
 
+/* Same as jli_memory_bytes(), but additionally accounts for a uniform
+ * per-node payload_size (in bytes) across every element — useful when
+ * every node's payload is the same fixed size and its memory should be
+ * counted as part of the structure's total footprint. */
 static int64_t jli_memory_bytes_with_payload(JLI *jli, size_t payload_size) {
     int64_t bytes = jli_memory_bytes(jli);
     if (payload_size > 0) bytes += (int64_t)jli->length * (int64_t)payload_size;
     return bytes;
 }
 
+/* Snapshot of the running maintenance/benchmarking counters accumulated
+ * in the JLI struct, exposed to callers via jli_get_maintenance_stats()
+ * so external benchmark code doesn't need to reach into JLI's
+ * otherwise-opaque internals. */
 typedef struct {
     int64_t local_scan_count;
     int64_t sub_scan_count;
@@ -1959,6 +2613,8 @@ typedef struct {
     int64_t total_node_touches;            /* NEW: local+sub node touches */
 } JLI_MaintenanceStats;
 
+/* Copies the current maintenance/instrumentation counters out of jli
+ * into *stats. Purely a read — does not reset any counters. */
 void jli_get_maintenance_stats(JLI *jli, JLI_MaintenanceStats *stats) {
     stats->local_scan_count      = jli->local_scan_counter;
     stats->sub_scan_count        = jli->suboptimal_scan_count;
@@ -1974,7 +2630,14 @@ void jli_get_maintenance_stats(JLI *jli, JLI_MaintenanceStats *stats) {
 
 /* ═══════════════════════════════════════════════════════════════════════
    REFERENCE SKIP‑LIST (unchanged)
-   ═══════════════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════════════
+   A standard, self-contained skip list (William Pugh style), included
+   here purely as a baseline to benchmark JLI against. It shares no
+   code or state with the JLI structures above except the separate
+   `rng_state` PRNG. p=0.5 per level, level count capped at a value
+   derived from n via sl_max_level_for_n() rather than a fixed constant,
+   so the cap scales sensibly with the dataset size used in a given
+   benchmark run. */
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -2046,6 +2709,12 @@ static int sl_rand_level_n(SL *s) {
     return l;
 }
 
+/* Standard skip-list insert: walk down from the top level recording
+ * the last-visited node at each level into `upd[]` (the nodes whose
+ * forward pointers will need to change), then splice a new node in at
+ * a freshly-rolled random level. No-op if v is already present. Copies
+ * `payload_size` bytes from `payload` into a fresh allocation owned by
+ * the new node (or leaves payload NULL if payload_size is 0). */
 static void sl_insert(SL *s, int32_t v,
                       const void *payload, size_t payload_size) {
     SLNode *upd[SL_HARD_MAX_LEVEL + 1];
@@ -2078,6 +2747,10 @@ static void sl_insert(SL *s, int32_t v,
     s->total_node_bytes += (int64_t)(sizeof(SLNode) + (l + 1) * sizeof(SLNode *));
 }
 
+/* Standard skip-list search: descend from the top level, advancing
+ * forward at each level while the next node's value is still < v, then
+ * drop a level; at level 0 the immediate next node is checked for an
+ * exact match. Returns the matching SLNode, or NULL if not present. */
 static SLNode *sl_search(SL *s, int32_t v) {
     SLNode *cur = s->head;
     for (int i = s->level; i >= 0; i--)
@@ -2086,6 +2759,10 @@ static SLNode *sl_search(SL *s, int32_t v) {
     return (cur && cur->val == v) ? cur : NULL;
 }
 
+/* Standard skip-list delete: same top-down walk as insert to populate
+ * `upd[]`, then unlink the target node at every level it appears in
+ * and shrink `s->level` while the top level(s) have become empty.
+ * Returns false without modifying anything if v isn't present. */
 static bool sl_delete(SL *s, int32_t v) {
     SLNode *upd[SL_HARD_MAX_LEVEL + 1];
     SLNode *cur = s->head;
@@ -2113,6 +2790,8 @@ static bool sl_delete(SL *s, int32_t v) {
     return true;
 }
 
+/* Frees every node in the skip list (including any per-node payload
+ * allocations) and the list header itself. */
 static void sl_destroy(SL *s) {
     SLNode *cur = s->head;
     while (cur) {
@@ -2124,10 +2803,16 @@ static void sl_destroy(SL *s) {
     free(s);
 }
 
+/* Total heap memory used by the skip list's structural nodes (header +
+ * every SLNode, including their variable-length forward-pointer
+ * arrays), NOT including payload bytes. Mirrors jli_memory_bytes() for
+ * comparable benchmarking against JLI. */
 static int64_t sl_memory_bytes(SL *s) {
     return (int64_t)sizeof(SL) + s->total_node_bytes;
 }
 
+/* Same as sl_memory_bytes(), but also includes payload bytes copied in
+ * via sl_insert(). Mirrors jli_memory_bytes_with_payload(). */
 static int64_t sl_mem_payload(SL *s) {
     return (int64_t)sizeof(SL) + s->total_node_bytes + s->total_payload_bytes;
 }
