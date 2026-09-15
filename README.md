@@ -39,14 +39,6 @@ JLI handles this with three escalating repair tiers, each scoped to a different 
 
 A separate, always-on mechanism (independent of the three tiers) handles **underflow**: any delete that shrinks a segment to ≤2 nodes triggers an immediate merge/removal, never deferred.
 
-### 41 structural invariants, proved against the implementation
-
-The paper doesn't just assert correctness — it states 41 structural invariants (sort order, partition consistency, shortcut-array shape, maintenance escalation rules, etc.) and gives inductive proofs checked line-by-line against the C implementation. The pass:
-- Proved **32** exactly as originally stated.
-- Proved **4 more** (shortcut monotonicity, block capacity, skip-list tower size, maintenance-reset attribution) in a corrected or more precise form.
-- Found **4** (interval/threshold ordering validation) genuinely **unenforced** in an earlier build — a real bug, reported and since fixed (the validator is now called unconditionally in the constructor).
-- Left **1** with a known, presently-inert accounting gap (a payload-byte counter not decremented on delete — never exercised in these payload-free benchmarks).
-
 ---
 
 ## What's better, and what isn't
@@ -65,9 +57,6 @@ This is where the trade-off resurfaces:
 - **DELETE**: +4.31% slower on average (median +2.51%). Close to parity or faster on most patterns, but sharply worse under `adversarial` (tail-delete), up to 1.33×.
 
 The mechanism is the same in both directions: sustained mutation concentrated at one boundary (the tail) drives the three-tier maintenance system to fire repeatedly, and each fire pays a fixed O(B) rebuild-floor cost that doesn't amortize away — a workload class where the paper's own amortized-O(log n) claim is proven, not assumed, to fail.
-
-**vs. B+-trees (complexity only, no benchmarks run).**
-JLI trades a **probabilistic** bound for a smaller constant factor; a B+-tree offers a **deterministic**, per-operation worst-case guarantee and disk/block alignment that JLI doesn't attempt to compete on. This is a genuine, stated limitation, not glossed over.
 
 ---
 
@@ -98,7 +87,6 @@ all_raw_runs.csv         # Every individual timed run, consolidated
 all_aggregated.csv       # Per-configuration aggregated results (the 87-row table behind Table 6)
 all_raw_runs_search.csv  # Raw runs from the parameter-search phase
 all_aggregated_search.csv# Aggregated results from the parameter-search phase
-FSTTCS_SUBMISSION_NO_8.pdf # The paper
 ```
 
 ### Building and running
