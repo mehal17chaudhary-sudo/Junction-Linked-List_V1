@@ -16,6 +16,7 @@ against a textbook probabilistic skip list. It accompanies FSTTCS submission no.
 | `maintaince/`, `no_maintaince/` | Raw/aggregated results from the long-run maintenance ablation : `nops = 40n` INSERT runs at `n = 50,000`, with the three-tier deferred maintenance system enabled (`maintaince/`) vs. disabled by setting `local_interval`/`sub_interval` above the run length (`no_maintaince/`). *(Note: both folder names are missing an "n" — `maintenance`/`no_maintenance` — as currently committed; see note above.)* |
 | `all_aggregated.csv`, `all_raw_runs.csv`, `all_ratio.csv` | Pre-generated consolidated result files, as produced by `collect_row.py` (plus a ratio-only view), corresponding to the main 87-configuration benchmark reported in the paper. |
 | `machine_2/` | Second-machine replication of the main benchmark, using the primary bench's already-tuned parameters (not an independent parameter search). See the dedicated note near the end of this README. |
+| `results/` | Explanation to all the results produce in the benchmarks |
 
 ## Build
 
