@@ -104,9 +104,8 @@ gcc -O3 -o bench 8.c -lm
 
 This is presented as a narrow, specific result, not a general claim that skip lists are obsolete:
 
-- It's tested against **one baseline** (a probabilistic skip list), chosen because it's the sharpest available test of "does the index have to live on the node." B-trees are excluded from the empirical comparison by design (they abandon the list representation entirely) and only compared analytically (Appendix H).
+- It's tested against **one baseline** (a probabilistic skip list), chosen because it's the sharpest available test of "does the index have to live on the node." B-trees are excluded from the empirical comparison by design (they abandon the list representation entirely) .
 - The parameter search optimized **one axis** (search latency) and is a bounded 100–200 trial search, not a verified global optimum.
 - Everything reported is **single-threaded** and **payload-free**; concurrency is future work, and the memory ratio is expected to move toward parity as real payload size grows.
 - The clean O(log n) search bound assumes K scales with S; every benchmarked configuration here holds K fixed, so the honest bound is O(log n + S/K).
 
-Full detail, all 87 rows, and the complete proof appendix are in the paper.
