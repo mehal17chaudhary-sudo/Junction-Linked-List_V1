@@ -73,21 +73,6 @@ The mechanism is the same in both directions: sustained mutation concentrated at
 
 ---
 
-## Repo layout
-
-```
-jli_v8_1.c              # The JLI data structure itself (Build, Search, Insert, Delete, MaintenanceHook)
-8.c                      # Benchmark harness — includes jli_v8_1.c, implements the reference skip list,
-                         #   pattern generators, and timing/memory accounting
-parameter_search.py      # Hierarchical random search over JLI's tuning parameters (S, K, block size,
-                         #   maintenance thresholds), per (section, pattern, size)
-collect_row.py           # Recursively collects raw_run_*.csv / aggregated.csv output, infers metadata
-                         #   from folder structure, and computes ratio/CI/Wilcoxon/sign-test statistics
-all_raw_runs.csv         # Every individual timed run, consolidated
-all_aggregated.csv       # Per-configuration aggregated results (the 87-row table behind Table 6)
-all_raw_runs_search.csv  # Raw runs from the parameter-search phase
-all_aggregated_search.csv# Aggregated results from the parameter-search phase
-```
 
 ### Building and running
 
