@@ -2,10 +2,6 @@
 
 **JLI** is a sorted linked list with a fast search index — but unlike a skip list, the index doesn't live inside the nodes. It lives entirely *outside* the list, in a separate three-level structure (junctions → blocks → block-level skip list) that sits on top of a completely ordinary, unmodified singly-linked list.
 
-This repo contains the C11 implementation, the benchmark harness, the raw/aggregated result data, and the paper (submitted to FSTTCS 2026, Track A) that describes and proves it.
-
-> 📄 Paper: [`FSTTCS_SUBMISSION_NO_8.pdf`](./FSTTCS_SUBMISSION_NO_8.pdf)
-
 ---
 
 ## The idea in one paragraph
