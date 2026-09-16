@@ -1,8 +1,8 @@
-# Junction-Linked List (JLI) — FSTTCS Submission No. 8
+# Junction-Linked List (JLI)
 
 This repository contains the reference implementation, benchmark harness, parameter
 search, and result-aggregation scripts for the Junction-Linked List (JLI), evaluated
-against a textbook probabilistic skip list. It accompanies FSTTCS submission no. 8.
+against a textbook probabilistic skip list.
 
 ## Repository contents
 
@@ -14,7 +14,7 @@ against a textbook probabilistic skip list. It accompanies FSTTCS submission no.
 | `run_insert.py` | Runs `8.c` with a **fixed, pre-determined** set of parameters over a fixed set of (section, pattern, n) configurations — i.e. it replays an already-chosen configuration rather than searching for one. Used both for standard final-evaluation runs and for the long-run maintenance ablation (see below). |
 | `collect_row.py` | Recursively walks a results directory tree, collects every `raw_run_*.csv` and `aggregated.csv` file it finds, infers `(section, pattern, n)` metadata from the folder names, and writes two consolidated CSVs: `all_raw_runs.csv` and `all_aggregated.csv`. For each configuration it also computes the JLI/skip-list mean ratio, a 95% CI, and two non-parametric significance tests (Wilcoxon signed-rank, sign test) directly from the raw per-run data, adding these as extra columns on the aggregated output. |
 | `maintaince/`, `no_maintaince/` | Raw/aggregated results from the long-run maintenance ablation : `nops = 40n` INSERT runs at `n = 50,000`, with the three-tier deferred maintenance system enabled (`maintaince/`) vs. disabled by setting `local_interval`/`sub_interval` above the run length (`no_maintaince/`). *(Note: both folder names are missing an "n" — `maintenance`/`no_maintenance` — as currently committed; see note above.)* |
-| `all_aggregated.csv`, `all_raw_runs.csv`, `all_ratio.csv` | Pre-generated consolidated result files, as produced by `collect_row.py` (plus a ratio-only view), corresponding to the main 87-configuration benchmark reported in the paper. |
+| `all_aggregated.csv`, `all_raw_runs.csv`, `all_ratio.csv` | Pre-generated consolidated result files, as produced by `collect_row.py` (plus a ratio-only view), corresponding to the main 87-configuration benchmark. |
 | `machine_2/` | Second-machine replication of the main benchmark, using the primary bench's already-tuned parameters (not an independent parameter search). See the dedicated note near the end of this README. |
 | `results/` | Explanation to all the results produce in the benchmarks |
 
@@ -54,8 +54,8 @@ python3 parameter_search.py --section INSERT --pattern zipfian --n-ref 500000 \
 
 Runs a hierarchical random search (reference-size search, then transfer + local
 refinement at each target size) against the compiled `bench` executable, optimizing
-purely for search-latency ratio (memory is never a search objective — see the paper's
-own discussion of this scope in Sections 6/9).
+purely for search-latency ratio (memory is never a search objective — see the
+discussion of this scope in Sections 6/9).
 
 ### 3. Re-run a fixed, already-chosen configuration
 
@@ -84,9 +84,9 @@ CSVs plus per-configuration ratio/CI/significance-test columns. Requires `scipy`
 CI and hypothesis-test columns (falls back to a normal approximation for the CI and
 leaves the p-value columns as NaN if `scipy` is unavailable).
 
-## Reproducing the paper's headline results
+## Reproducing the headline results
 
-The tuned parameters this paper reports are already baked into the CSVs committed in
+The tuned parameters reported here are already baked into the CSVs committed in
 this repo, so reproduction does **not** require re-running `parameter_search.py` from
 scratch — it means replaying those already-found parameters through `run_insert.py`.
 
