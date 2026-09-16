@@ -1,8 +1,9 @@
 # Junction-Linked List (JLI)
 
-This repository contains the reference implementation, benchmark harness, parameter
-search, and result-aggregation scripts for the Junction-Linked List (JLI), evaluated
-against a textbook probabilistic skip list.
+This document maps every file and folder in this repository to its purpose. It covers
+the reference implementation, benchmark harness, parameter search, and
+result-aggregation scripts for the Junction-Linked List (JLI), evaluated against a
+textbook probabilistic skip list.
 
 ## Repository contents
 
@@ -13,11 +14,11 @@ against a textbook probabilistic skip list.
 | `parameter_search.py` | Hierarchical random-search driver that tunes JLI's structural and maintenance parameters (segment size, shortcut budget, block size, drift thresholds, maintenance intervals, etc.) against `8.c`, optimizing solely for search-latency ratio. |
 | `run_insert.py` | Runs `8.c` with a **fixed, pre-determined** set of parameters over a fixed set of (section, pattern, n) configurations — i.e. it replays an already-chosen configuration rather than searching for one. Used both for standard final-evaluation runs and for the long-run maintenance ablation (see below). |
 | `collect_row.py` | Recursively walks a results directory tree, collects every `raw_run_*.csv` and `aggregated.csv` file it finds, infers `(section, pattern, n)` metadata from the folder names, and writes two consolidated CSVs: `all_raw_runs.csv` and `all_aggregated.csv`. For each configuration it also computes the JLI/skip-list mean ratio, a 95% CI, and two non-parametric significance tests (Wilcoxon signed-rank, sign test) directly from the raw per-run data, adding these as extra columns on the aggregated output. |
-| `maintaince/`, `no_maintaince/` | Raw/aggregated results from the long-run maintenance ablation : `nops = 40n` INSERT runs at `n = 50,000`, with the three-tier deferred maintenance system enabled (`maintaince/`) vs. disabled by setting `local_interval`/`sub_interval` above the run length (`no_maintaince/`). *(Note: both folder names are missing an "n" — `maintenance`/`no_maintenance` — as currently committed; see note above.)* |
+| `maintenance/`, `no_maintenance/` | Raw/aggregated results from the long-run maintenance ablation: `nops = 40n` INSERT runs at `n = 50,000`, with the three-tier deferred maintenance system enabled (`maintenance/`) vs. disabled by setting `local_interval`/`sub_interval` above the run length (`no_maintenance/`). |
 | `all_aggregated.csv`, `all_raw_runs.csv`, `all_ratio.csv` | Pre-generated consolidated result files, as produced by `collect_row.py` (plus a ratio-only view), corresponding to the main 87-configuration benchmark. |
-| `machine_2/` | Second-machine replication of the main benchmark, using the primary bench's already-tuned parameters (not an independent parameter search). See the dedicated note near the end of this README. |
-| `results/` | Explanation to all the results produce in the benchmarks |
-| `JLI_explained.md` | Overview of the data structure |
+| `machine_2/` | Second-machine replication of the main benchmark, using the primary bench's already-tuned parameters (not an independent parameter search). See the dedicated note near the end of this document. |
+| `results/` | Walkthrough of the benchmark results — per-section breakdowns, the maintenance ablation, the cross-device check, and the charts backing each claim. |
+| `JLI_explained.md` | Conceptual overview of the data structure: how the junction/block/skip-list hierarchy works and what trade-offs it makes. |
 
 ## Build
 
@@ -68,7 +69,7 @@ python3 run_insert.py --section INSERT --patterns adversarial zipfian \
 
 This is the script used both for standard final-evaluation runs (feeding in parameters
 already found by `parameter_search.py`) and for the long-run maintenance ablation runs
-that produced `maintaince/` and `no_maintaince/` (by fixing `local_interval`/`sub_interval`
+that produced `maintenance/` and `no_maintenance/` (by fixing `local_interval`/`sub_interval`
 above the run length to disable maintenance in the latter case).
 
 ### 4. Consolidate results
@@ -108,13 +109,13 @@ scratch — it means replaying those already-found parameters through `run_inser
    CSV.)
 
 3. **Long-run maintenance ablation:** do the same with the two ablation CSVs, once
-   against the `maintaince/` results CSV and once against `no_maintaince/`'s, to replay
+   against the `maintenance/` results CSV and once against `no_maintenance/`'s, to replay
    the `nops = 40n`, `n = 50000` INSERT runs with maintenance enabled vs. disabled:
 
    ```bash
-   python3 run_insert.py --section INSERT --params-csv maintaince/aggregated.csv \
+   python3 run_insert.py --section INSERT --params-csv maintenance/aggregated.csv \
        --reps 10 --runs 30 --output-dir reproduce_maintenance
-   python3 run_insert.py --section INSERT --params-csv no_maintaince/aggregated.csv \
+   python3 run_insert.py --section INSERT --params-csv no_maintenance/aggregated.csv \
        --reps 10 --runs 30 --output-dir reproduce_no_maintenance
    ```
 
