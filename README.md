@@ -43,7 +43,7 @@ A separate, always-on mechanism (independent of the three tiers) handles **under
 
 ## What's better, and what isn't
 
-JLI is compared against a **textbook probabilistic skip list** (p = 0.5) — deliberately the sharpest baseline available, since a skip list isolates the "index lives on the node" cost with no other structural change (unlike a B-tree, which replaces the list entirely). It is *not* compared against B-trees/B+-trees empirically; Appendix H gives a complexity-only comparison instead (see below).
+JLI is compared against a **textbook probabilistic skip list** (p = 0.5) — deliberately the sharpest baseline available, since a skip list isolates the "index lives on the node" cost with no other structural change (unlike a B-tree, which replaces the list entirely). It is *not* compared against B-trees/B+-trees empirically; a complexity-only comparison is given instead (see below).
 
 **Memory — unconditionally better.**
 Across all 87 tested configurations, JLI's structural index overhead was **75.0%–80.4%** of the skip list's (mean ≈77.8%), with **zero exceptions**. This holds most cleanly in BUILD (a single fixed configuration, never tuned for search), showing the memory win is structural, not a side effect of the parameter search favoring memory-friendly configs.
@@ -56,7 +56,7 @@ This is where the trade-off resurfaces:
 - **INSERT**: averaged with sign, +7.28% slower than the skip list (median +5.41%). Actually *faster* under `adversarial` (tail-append) and `random`; worst under `zipfian` (up to 1.36×).
 - **DELETE**: +4.31% slower on average (median +2.51%). Close to parity or faster on most patterns, but sharply worse under `adversarial` (tail-delete), up to 1.33×.
 
-The mechanism is the same in both directions: sustained mutation concentrated at one boundary (the tail) drives the three-tier maintenance system to fire repeatedly, and each fire pays a fixed O(B) rebuild-floor cost that doesn't amortize away — a workload class where the paper's own amortized-O(log n) claim is proven, not assumed, to fail.
+The mechanism is the same in both directions: sustained mutation concentrated at one boundary (the tail) drives the three-tier maintenance system to fire repeatedly, and each fire pays a fixed O(B) rebuild-floor cost that doesn't amortize away — a workload class where the amortized-O(log n) claim is proven, not assumed, to fail.
 
 ---
 
@@ -65,7 +65,7 @@ The mechanism is the same in both directions: sustained mutation concentrated at
 - **Baseline**: a textbook probabilistic skip list (p = 0.5), same translation unit, same key pools, generators, and memory/timing accounting code — so the comparison is apples-to-apples.
 - **Sections**: `BUILD` (bulk construction, 7 sizes), `STATIC` (search-only, 6 access patterns), `INSERT` and `DELETE` (5 patterns each) — **87 total (section, pattern, n) configurations**, every one reported, none omitted.
 - **Sizes**: n ∈ {10K, 50K, 100K, 250K, 500K, 750K, 1M} for BUILD; {50K, 100K, 250K, 500K, 1M} for the rest.
-- **Access patterns**: `random`, `sequential`, `hotspot`, `zipfian`, `miss` (STATIC only), and `adversarial` — note `adversarial` means three *different* things per section (guaranteed-miss lookups in STATIC, monotonic tail-append in INSERT, tail-backward delete in DELETE); the paper spells out each precisely rather than relying on the name.
+- **Access patterns**: `random`, `sequential`, `hotspot`, `zipfian`, `miss` (STATIC only), and `adversarial` — note `adversarial` means three *different* things per section (guaranteed-miss lookups in STATIC, monotonic tail-append in INSERT, tail-backward delete in DELETE); each is spelled out precisely rather than relying on the name.
 - **Tuning**: STATIC/INSERT/DELETE were each tuned via a bounded hierarchical random search (100–200 trials) *optimizing solely for search-latency ratio* — memory was never a search objective, which is why the memory-invariance result is treated as a found regularity, not an enforced one. BUILD used one fixed, untuned configuration.
 - **Repetition**: 30 internal timed runs per process, aggregated into mean/median/percentile stats, averaged across 10 process repetitions (first discarded as cold start).
 - **Hardware**: primary run on an AMD Ryzen 7 7735HS (8 cores, 16 GB RAM); STATIC was independently re-run in full on a second machine (Intel i5-1155G7, 4C/8T, 8 GB RAM) as a cross-device check. Memory replicated cleanly (75.1–79.2%); the search-latency advantage held directionally but narrowed — and reversed on a few patterns — at n = 1M on the lower-core-count machine, so the latency win is flagged as more hardware-sensitive than the primary numbers alone suggest.
@@ -89,8 +89,7 @@ gcc -O3 -o bench 8.c -lm
 
 This is presented as a narrow, specific result, not a general claim that skip lists are obsolete:
 
-- It's tested against **one baseline** (a probabilistic skip list), chosen because it's the sharpest available test of "does the index have to live on the node." B-trees are excluded from the empirical comparison by design (they abandon the list representation entirely) .
+- It's tested against **one baseline** (a probabilistic skip list), chosen because it's the sharpest available test of "does the index have to live on the node." B-trees are excluded from the empirical comparison by design (they abandon the list representation entirely).
 - The parameter search optimized **one axis** (search latency) and is a bounded 100–200 trial search, not a verified global optimum.
 - Everything reported is **single-threaded** and **payload-free**; concurrency is future work, and the memory ratio is expected to move toward parity as real payload size grows.
 - The clean O(log n) search bound assumes K scales with S; every benchmarked configuration here holds K fixed, so the honest bound is O(log n + S/K).
-
