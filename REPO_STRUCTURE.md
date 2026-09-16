@@ -17,6 +17,7 @@ against a textbook probabilistic skip list.
 | `all_aggregated.csv`, `all_raw_runs.csv`, `all_ratio.csv` | Pre-generated consolidated result files, as produced by `collect_row.py` (plus a ratio-only view), corresponding to the main 87-configuration benchmark. |
 | `machine_2/` | Second-machine replication of the main benchmark, using the primary bench's already-tuned parameters (not an independent parameter search). See the dedicated note near the end of this README. |
 | `results/` | Explanation to all the results produce in the benchmarks |
+| `JLI_explained.md` | Overview of the data structure |
 
 ## Build
 
