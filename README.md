@@ -4,6 +4,31 @@
 
 ---
 
+## Results at a glance
+
+Compared against a textbook skip list (p = 0.5) across 87 configurations, single-threaded and payload-free.
+
+| Metric | Result vs. skip list |
+|---|---|
+| Index memory | 75.0–80.4% of skip list (mean ≈ 77.8%), in all 87 configs |
+| Search (STATIC) | Faster in all 30 configs on the primary machine: 1.07–1.12× (miss) up to 2.68–3.90× (adversarial) |
+| Insert | +7.28% slower on average (median +5.41%); worst case 1.36× slower (zipfian) |
+| Delete | +4.31% slower on average (median +2.51%); worst case 1.33× slower (adversarial) |
+
+The search advantage was more hardware-sensitive than these numbers suggest: on a second, lower-core-count machine it narrowed, and reversed on a few patterns at n = 1M. Details are in [How it was tested](#how-it-was-tested).
+
+## Quickstart
+
+```bash
+gcc -O3 -o bench 8.c -lm
+./bench
+python collect_row.py --input-dir results
+```
+
+The first two lines build and run the benchmark. The third aggregates the output into `all_raw_runs.csv` and `all_aggregated.csv`, with per-configuration ratios, 95% CIs, and significance tests. For the parameter search, see `parameter_search.py`.
+
+---
+
 ## The idea in one paragraph
 
 A sorted linked list is cheap to splice but costs O(n) to search. The classical fix is a **skip list**: give every node a randomized tower of forward pointers, so search descends the towers in O(log n). That's effective, but it's also a *per-node tax* — every single node pays for an index whether or not it's ever used to route a query. JLI asks: does that index have to live on the node at all? JLI keeps the base list a genuine, plain linked list (nodes only carry `value`, `payload`, `next` — no index field), and moves the entire search apparatus into an external hierarchy that indexes the list in *segments* rather than per element.
@@ -45,18 +70,18 @@ A separate, always-on mechanism (independent of the three tiers) handles **under
 
 JLI is compared against a **textbook probabilistic skip list** (p = 0.5) — deliberately the sharpest baseline available, since a skip list isolates the "index lives on the node" cost with no other structural change (unlike a B-tree, which replaces the list entirely). It is *not* compared against B-trees/B+-trees empirically; a complexity-only comparison is given instead (see below).
 
-**Memory — unconditionally better.**
+**Memory — better in all 87 tested configurations.**
 Across all 87 tested configurations, JLI's structural index overhead was **75.0%–80.4%** of the skip list's (mean ≈77.8%), with **zero exceptions**. This holds most cleanly in BUILD (a single fixed configuration, never tuned for search), showing the memory win is structural, not a side effect of the parameter search favoring memory-friendly configs.
 
-**Search — unconditionally better in this study.**
-JLI's mean search latency was lower than the skip list's in **all 30 STATIC configurations tested**, never reversing at the sizes and machine tested. Advantage ranges from **1.07×–1.12×** under `miss` (worst case) up to **2.68×–3.90×** under `adversarial` (best case).
+**Search — better in all 30 STATIC configurations on the primary machine.**
+JLI's mean search latency was lower than the skip list's in **all 30 STATIC configurations tested** on the primary machine. Advantage ranges from **1.07×–1.12×** under `miss` (worst case) up to **2.68×–3.90×** under `adversarial` (best case). On the second, lower-core-count machine the advantage narrowed and reversed on a few patterns at n = 1M (see [How it was tested](#how-it-was-tested)).
 
 **Mutation — a real tax, direction-dependent.**
 This is where the trade-off resurfaces:
 - **INSERT**: averaged with sign, +7.28% slower than the skip list (median +5.41%). Actually *faster* under `adversarial` (tail-append) and `random`; worst under `zipfian` (up to 1.36×).
 - **DELETE**: +4.31% slower on average (median +2.51%). Close to parity or faster on most patterns, but sharply worse under `adversarial` (tail-delete), up to 1.33×.
 
-The mechanism is the same in both directions: sustained mutation concentrated at one boundary (the tail) drives the three-tier maintenance system to fire repeatedly, and each fire pays a fixed O(B) rebuild-floor cost that doesn't amortize away — a workload class where the amortized-O(log n) claim is proven, not assumed, to fail.
+The mechanism is the same in both directions: sustained mutation concentrated at one boundary (the tail) drives the three-tier maintenance system to fire repeatedly, and each fire pays a fixed O(B) rebuild-floor cost that doesn't amortize away — a workload class where the amortized-O(log n) claim is observed not to hold.
 
 ---
 
@@ -70,18 +95,6 @@ The mechanism is the same in both directions: sustained mutation concentrated at
 - **Repetition**: 30 internal timed runs per process, aggregated into mean/median/percentile stats, averaged across 10 process repetitions (first discarded as cold start).
 - **Hardware**: primary run on an AMD Ryzen 7 7735HS (8 cores, 16 GB RAM); STATIC was independently re-run in full on a second machine (Intel i5-1155G7, 4C/8T, 8 GB RAM) as a cross-device check. Memory replicated cleanly (75.1–79.2%); the search-latency advantage held directionally but narrowed — and reversed on a few patterns — at n = 1M on the lower-core-count machine, so the latency win is flagged as more hardware-sensitive than the primary numbers alone suggest.
 - **Statistics**: `collect_row.py` aggregates all raw/aggregated CSVs and computes, per configuration, the mean JLI/skip-list ratio, its 95% CI, a Wilcoxon signed-rank test, and a sign test — all included in `all_aggregated.csv`.
-
----
-
-
-### Building and running
-
-```bash
-gcc -O3 -o bench 8.c -lm
-./bench   # runs the configured benchmark sections; see parameter_search.py for search-mode invocation
-```
-
-`parameter_search.py` drives the compiled harness across the hierarchical search; `collect_row.py` then walks the resulting output tree and produces the two consolidated CSVs above (pass `--input-dir` pointing at the results tree).
 
 ---
 
